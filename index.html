@@ -500,7 +500,7 @@ const Polytope = (() => {
   const vertexGeo = new THREE.SphereGeometry(0.052, 12, 12);
   const WHITE_COLOR = new THREE.Color(0xffffff);
   const CANDIDATE_COLOR = new THREE.Color(0xffc857);
-  const BLOCKED_COLOR = new THREE.Color(0x6f86a8);
+  const BLOCKED_COLOR = new THREE.Color(0x93b8e8);
   const OPTIMUM_COLOR = new THREE.Color(0xfff1b8);
 
   // Persistent cursor sphere — the moving "current vertex" indicator
@@ -671,13 +671,13 @@ const Polytope = (() => {
       if (!isRelevant && (nearCursor || nearActiveEdge)) opacity *= 0.28;
       if (!isRelevant && behindCursor) opacity *= 0.55;
       if (consideration === 'candidate') { opacity = Math.max(opacity, 0.74); scale = Math.max(scale, 1.18); }
-      if (consideration === 'blocked') { opacity = Math.max(opacity, 0.48); scale = Math.max(scale, 1.02); }
+      if (consideration === 'blocked') { opacity = Math.max(opacity, 0.62); scale = Math.max(scale, 1.08); }
       if (isRelevant) opacity = Math.max(opacity, 0.50);
       if (isNext) { opacity = 0.86; scale = 1.28; }
       if (isCurrent) { opacity = 1.0; scale = 1.55; }
 
       s.material.color.copy(base);
-      if (consideration === 'blocked') s.material.color.lerp(BLOCKED_COLOR, 0.72);
+      if (consideration === 'blocked') s.material.color.lerp(BLOCKED_COLOR, 0.82);
       if (consideration === 'candidate') s.material.color.lerp(CANDIDATE_COLOR, 0.78);
       if (isRelevant) s.material.color.lerp(WHITE_COLOR, isCurrent ? 0.72 : 0.34);
       if (isNext) s.material.color.copy(WHITE_COLOR);
@@ -816,9 +816,9 @@ const Polytope = (() => {
       consideredVertices.set(idx, isChosen ? 'chosen' : (isImproving ? 'candidate' : 'blocked'));
       const seg = makeEdgeSegment(
         from, vertices[idx],
-        isChosen ? 0xffffff : (isImproving ? 0xffc857 : 0x6f86a8),
-        isChosen ? 0.023 : (isImproving ? 0.008 + 0.010 * strength : 0.006),
-        isChosen ? 0.88 : (isImproving ? 0.22 + 0.34 * strength : 0.16),
+        isChosen ? 0xffffff : (isImproving ? 0xffc857 : 0x93b8e8),
+        isChosen ? 0.023 : (isImproving ? 0.008 + 0.010 * strength : 0.009),
+        isChosen ? 0.88 : (isImproving ? 0.22 + 0.34 * strength : 0.34),
         isChosen ? 'chosen' : (isImproving ? 'candidate' : 'blocked')
       );
       if (seg) hintSegs.push(seg);
@@ -830,7 +830,7 @@ const Polytope = (() => {
     const from = vertices[fromIdx];
     for (const idx of blocked) {
       consideredVertices.set(idx, 'blocked');
-      const seg = makeEdgeSegment(from, vertices[idx], 0x6f86a8, 0.010, 0.22);
+      const seg = makeEdgeSegment(from, vertices[idx], 0x93b8e8, 0.011, 0.36);
       if (seg) hintSegs.push(seg);
     }
   }
