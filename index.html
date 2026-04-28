@@ -1,0 +1,1581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A fullscreen WebGL screensaver visualizing simplex walks across morphing 3D polytopes.">
+  <meta name="theme-color" content="#050508">
+  <title>Simplex</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; background: #050508; overflow: hidden; }
+    body { color-scheme: dark; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+<canvas id="c" aria-label="Simplex screensaver animation"></canvas>
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer }  from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass }      from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass }      from 'three/addons/postprocessing/OutputPass.js';
+import { ConvexGeometry }  from 'three/addons/geometries/ConvexGeometry.js';
+
+// ── Timing constants ──────────────────────────────────────────────────────────
+const SIMPLEX_IDLE_MS      = 900;
+const HOP_DURATION_MS      = 2200;
+const AT_VERTEX_MS         = 900;
+const AT_OPTIMUM_MS        = 3200;
+const TRANSITION_MS        = 4500;
+const TRAIL_FADE_MS        = 5500;
+const EDGE_PREVIEW_MS      = 1250;
+const MIN_SIMPLEX_EDGE_LEN = 0.78;
+const CAMERA_ORBIT_DEG_S   = 0.25;
+const CAMERA_TILT_PERIOD_S = 40;
+const CAMERA_TRACK_STRENGTH = 0.24;
+const CAMERA_LOOK_ORIGIN_BIAS = 0.40;
+const SCENE_BANK_SIZE = 10;
+const TRANSITION_SAMPLE_FPS = 30;
+const TAU = Math.PI * 2;
+
+// ── Colour palette ────────────────────────────────────────────────────────────
+const PALETTE = [
+  new THREE.Color(0x4a7fa5), // slate blue
+  new THREE.Color(0x3d9e8c), // teal
+  new THREE.Color(0xa54a6b), // dusty rose
+  new THREE.Color(0xd4843a), // warm amber
+  new THREE.Color(0x5a8a5a), // sage
+  new THREE.Color(0x7a5aaa), // lavender
+  new THREE.Color(0x5a7a8a), // steel
+  new THREE.Color(0x3a8a7a), // seafoam
+];
+let paletteIdx = 0;
+
+const SCORE_LOW_COLOR  = new THREE.Color(0x173d9a);
+const SCORE_MID_COLOR  = new THREE.Color(0x5fd9ff);
+const SCORE_HIGH_COLOR = new THREE.Color(0xffa000);
+const SCORE_OPT_COLOR  = new THREE.Color(0xfffff0);
+
+// ── Shared utilities ──────────────────────────────────────────────────────────
+function easeInOutCubic(t) {
+  return t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t+2, 3)/2;
+}
+
+function damp(rate, dt) {
+  return 1 - Math.exp(-rate * Math.max(0, dt));
+}
+
+function slerpVec3(a, b, t) {
+  return slerpVec3Into(new THREE.Vector3(), a, b, t);
+}
+
+function slerpVec3Into(out, a, b, t) {
+  const dot = Math.max(-1, Math.min(1, a.dot(b)));
+  if (dot > 0.9999) return out.copy(a).lerp(b, t).normalize();
+  if (dot < -0.9999) {
+    const axis = Math.abs(a.x) < 0.9
+      ? new THREE.Vector3(1, 0, 0)
+      : new THREE.Vector3(0, 1, 0);
+    const ortho = new THREE.Vector3().crossVectors(a, axis).normalize();
+    return out.copy(a)
+      .multiplyScalar(Math.cos(Math.PI * t))
+      .addScaledVector(ortho, Math.sin(Math.PI * t))
+      .normalize();
+  }
+  const angle    = Math.acos(dot);
+  const sinAngle = Math.sin(angle);
+  const s1 = Math.sin((1-t) * angle) / sinAngle;
+  const s2 = Math.sin(t     * angle) / sinAngle;
+  return out.set(s1*a.x+s2*b.x, s1*a.y+s2*b.y, s1*a.z+s2*b.z).normalize();
+}
+
+// IIFE modules follow here (Tasks 2–7)
+
+// ── LP ────────────────────────────────────────────────────────────────────────
+const LP = (() => {
+  function randomOnSphere() {
+    let v;
+    do {
+      v = new THREE.Vector3(Math.random()*2-1, Math.random()*2-1, Math.random()*2-1);
+    } while (v.lengthSq() < 0.001);
+    return v.normalize();
+  }
+
+  function cubeCage() {
+    return [
+      { n: new THREE.Vector3( 1, 0, 0), b: 2 },
+      { n: new THREE.Vector3(-1, 0, 0), b: 2 },
+      { n: new THREE.Vector3( 0, 1, 0), b: 2 },
+      { n: new THREE.Vector3( 0,-1, 0), b: 2 },
+      { n: new THREE.Vector3( 0, 0, 1), b: 2 },
+      { n: new THREE.Vector3( 0, 0,-1), b: 2 },
+    ];
+  }
+
+  const GALLERY = [
+    {
+      objective: [0.92, 0.48, 0.35],
+      cuts: [
+        [[ 1,  1,  1], 4.05], [[-1,  1,  1], 3.25], [[ 1, -1,  1], 3.45],
+        [[ 1,  1, -1], 3.10], [[-1, -1,  1], 2.85], [[-1,  1, -1], 3.55],
+        [[ 1, -1, -1], 3.35], [[ 2,  1,  0], 3.60], [[ 0,  2,  1], 3.25],
+        [[ 1,  0,  2], 3.40], [[-2,  1,  1], 3.35], [[ 1, -2,  1], 3.20],
+      ]
+    },
+    {
+      objective: [-0.50, 0.95, 0.55],
+      cuts: [
+        [[ 1,  2,  1], 3.55], [[-1,  2,  1], 3.30], [[ 1,  2, -1], 3.25],
+        [[-1,  2, -1], 3.10], [[ 2,  0,  1], 3.10], [[-2,  1,  0], 3.00],
+        [[ 0, -1,  2], 2.95], [[ 1, -1,  2], 3.20], [[-1, -1,  2], 3.10],
+        [[ 2, -1, -1], 3.15], [[-2, -1,  1], 3.25], [[ 0,  1, -2], 2.85],
+      ]
+    },
+    {
+      objective: [0.35, -0.65, 1.00],
+      cuts: [
+        [[ 1,  0,  2], 3.10], [[-1,  0,  2], 3.00], [[ 0,  1,  2], 3.15],
+        [[ 0, -1,  2], 3.05], [[ 1,  1, -1], 2.80], [[-1,  1, -1], 3.20],
+        [[ 1, -1, -1], 3.00], [[-1, -1, -1], 2.90], [[ 2,  1,  1], 3.55],
+        [[-2,  1,  1], 3.15], [[ 1, -2,  1], 3.25], [[-1, -2,  1], 3.00],
+      ]
+    },
+    {
+      objective: [-0.75, -0.55, 0.80],
+      cuts: [
+        [[-2, -1,  1], 3.40], [[-1, -2,  1], 3.25], [[-1, -1,  2], 3.35],
+        [[ 1, -1,  2], 3.10], [[-1,  1,  2], 3.05], [[ 1,  1,  1], 3.20],
+        [[ 2,  1, -1], 3.05], [[ 1,  2, -1], 3.15], [[-2,  1, -1], 3.00],
+        [[ 1, -2, -1], 3.30], [[ 0, -2,  1], 2.95], [[-2,  0,  1], 3.00],
+      ]
+    },
+  ];
+
+  function fromTemplate(template) {
+    const constraints = cubeCage();
+    const jitter = 0.96 + Math.random() * 0.08;
+    for (const [rawN, rawB] of template.cuts) {
+      const n = new THREE.Vector3(...rawN).normalize();
+      constraints.push({ n, b: rawB * jitter / Math.hypot(...rawN) });
+    }
+    const objective = new THREE.Vector3(...template.objective).normalize();
+    return { constraints, objective };
+  }
+
+  function generateCurated() {
+    return fromTemplate(GALLERY[Math.floor(Math.random() * GALLERY.length)]);
+  }
+
+  function generate() {
+    if (Math.random() < 0.75) return generateCurated();
+
+    // Cube bounding cage ±2. Support function: h(n) = 2*(|nx|+|ny|+|nz|) for any unit normal n.
+    const constraints = cubeCage();
+    const nRandom = 10 + Math.floor(Math.random() * 9); // 10–18 cuts for richer polytopes
+    let added = 0;
+    while (added < nRandom) {
+      const n = randomOnSphere();
+      // Reject near-axis-aligned normals: they slice off a whole face-half (4 vertices at once)
+      // instead of chamfering a corner (1 vertex). Keeps shapes visually complex.
+      if (Math.max(Math.abs(n.x), Math.abs(n.y), Math.abs(n.z)) > 0.8) continue;
+      // Support of cube ±2 in direction n = 2 * L1_norm(n)
+      const extent = 2 * (Math.abs(n.x) + Math.abs(n.y) + Math.abs(n.z));
+      // 70–90%: shallower cuts avoid tiny sliver facets and clustered vertices.
+      const b = (0.70 + Math.random() * 0.20) * extent;
+      constraints.push({ n, b });
+      added++;
+    }
+    return { constraints, objective: randomOnSphere() };
+  }
+
+  return { generate, generateCurated };
+})();
+
+// ── VertexEnum ────────────────────────────────────────────────────────────────
+const VertexEnum = (() => {
+  const EPS       = 1e-6;
+  const TIGHT_EPS = 1e-5;
+
+  function det3(a, b, c) {
+    return a.x*(b.y*c.z - b.z*c.y)
+          -a.y*(b.x*c.z - b.z*c.x)
+          +a.z*(b.x*c.y - b.y*c.x);
+  }
+
+  // Solve [c0.n; c1.n; c2.n] · x = [c0.b, c1.b, c2.b] via Cramer's rule.
+  function solve3(c0, c1, c2) {
+    const colX = new THREE.Vector3(c0.n.x, c1.n.x, c2.n.x);
+    const colY = new THREE.Vector3(c0.n.y, c1.n.y, c2.n.y);
+    const colZ = new THREE.Vector3(c0.n.z, c1.n.z, c2.n.z);
+    const rhs  = new THREE.Vector3(c0.b,   c1.b,   c2.b);
+    const d = det3(colX, colY, colZ);
+    if (Math.abs(d) < EPS) return null;
+    const inv = 1/d;
+    return new THREE.Vector3(
+      inv * det3(rhs,  colY, colZ),
+      inv * det3(colX, rhs,  colZ),
+      inv * det3(colX, colY, rhs )
+    );
+  }
+
+  function enumerate(lp) {
+    const { constraints: cs, objective } = lp;
+    const n = cs.length;
+    const verts  = [];
+    const tights = [];
+
+    for (let i = 0; i < n-2; i++) {
+      for (let j = i+1; j < n-1; j++) {
+        for (let k = j+1; k < n; k++) {
+          const pt = solve3(cs[i], cs[j], cs[k]);
+          if (!pt || !isFinite(pt.x) || !isFinite(pt.y) || !isFinite(pt.z)) continue;
+
+          // Feasibility check against all other constraints
+          let ok = true;
+          for (let l = 0; l < n; l++) {
+            if (l===i||l===j||l===k) continue;
+            if (cs[l].n.dot(pt) > cs[l].b + TIGHT_EPS) { ok=false; break; }
+          }
+          if (!ok) continue;
+
+          // Deduplicate
+          let dup = false;
+          for (const v of verts) if (v.distanceTo(pt) < TIGHT_EPS) { dup=true; break; }
+          if (dup) continue;
+
+          // Compute tight constraint set
+          const tight = [];
+          for (let l = 0; l < n; l++) {
+            if (Math.abs(cs[l].n.dot(pt) - cs[l].b) < TIGHT_EPS) tight.push(l);
+          }
+          verts.push(pt);
+          tights.push(tight);
+        }
+      }
+    }
+
+    if (verts.length < 4) return null;
+
+    const m = verts.length;
+
+    // Adjacency: two vertices are adjacent if they share ≥2 tight constraints.
+    // Known limitation: can produce false edges in degenerate configs (4+ planes at a
+    // point). Vanishingly rare with random constraints. Symptom: path jumps interior.
+    const adj = Array.from({length:m}, ()=>[]);
+    for (let i = 0; i < m; i++) {
+      for (let j = i+1; j < m; j++) {
+        let shared = 0;
+        for (const c of tights[i]) if (tights[j].includes(c)) shared++;
+        if (shared >= 2) { adj[i].push(j); adj[j].push(i); }
+      }
+    }
+
+    // Connectivity
+    const seen = new Set([0]);
+    const q    = [0];
+    while (q.length) {
+      const v = q.shift();
+      for (const w of adj[v]) if (!seen.has(w)) { seen.add(w); q.push(w); }
+    }
+    if (seen.size !== m) return null;
+
+    const objVals = verts.map(v => objective.dot(v));
+    if (Math.max(...objVals) - Math.min(...objVals) < TIGHT_EPS*10) return null;
+
+    return { vertices: verts, tights, adj, objVals };
+  }
+
+  return { enumerate };
+})();
+
+// ── Simplex ───────────────────────────────────────────────────────────────────
+const Simplex = (() => {
+  function solve(enumResult) {
+    const { vertices, adj, objVals } = enumResult;
+    const n = vertices.length;
+
+    // Start from the worst feasible vertex.
+    let cur = 0;
+    for (let i = 1; i < n; i++) {
+      if (objVals[i] < objVals[cur]) cur = i;
+    }
+
+    const path = [cur];
+    const visited = new Set([cur]);
+
+    while (true) {
+      const improving = adj[cur]
+        .filter(nb => objVals[nb] > objVals[cur] + 1e-9);
+
+      if (improving.length === 0) break;
+
+      improving.sort((a, b) => {
+        const da = vertices[cur].distanceTo(vertices[a]);
+        const db = vertices[cur].distanceTo(vertices[b]);
+
+        const improveA = objVals[a] - objVals[cur];
+        const improveB = objVals[b] - objVals[cur];
+
+        // Strongly penalize short / visually bad pivots.
+        const shortPenaltyA = da < MIN_SIMPLEX_EDGE_LEN ? 1000 : 0;
+        const shortPenaltyB = db < MIN_SIMPLEX_EDGE_LEN ? 1000 : 0;
+
+        // Prefer larger visible moves, then larger objective improvement.
+        const scoreA = shortPenaltyA - da * 2.0 - improveA;
+        const scoreB = shortPenaltyB - db * 2.0 - improveB;
+
+        return scoreA - scoreB;
+      });
+
+      const next = improving[0];
+
+      // Should not happen with strictly increasing objective, but protects against bugs.
+      if (visited.has(next)) return null;
+
+      cur = next;
+      visited.add(cur);
+      path.push(cur);
+
+      if (path.length > 2 * n) return null;
+    }
+
+    return path;
+  }
+
+  return { solve };
+})();
+
+// ── SceneRenderer ─────────────────────────────────────────────────────────────
+const SceneRenderer = (() => {
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x050508);
+
+  const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 100);
+
+  const renderer = new THREE.WebGLRenderer({
+    canvas: document.getElementById('c'),
+    antialias: true
+  });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+
+  const composer = new EffectComposer(renderer);
+  composer.addPass(new RenderPass(scene, camera));
+  composer.addPass(new UnrealBloomPass(
+    new THREE.Vector2(innerWidth, innerHeight),
+    0.85,
+    0.5,  // radius
+    0.2   // threshold — only emissive objects bloom
+  ));
+  composer.addPass(new OutputPass());
+
+  // Ambient fill
+  scene.add(new THREE.AmbientLight(0xffffff, 0.3));
+
+  // Objective-aligned light (position updated per LP)
+  const objLight  = new THREE.DirectionalLight(0xffffff, 0.8);
+  const fillLight = new THREE.DirectionalLight(0x8888ff, 0.2);
+  scene.add(objLight);
+  scene.add(fillLight);
+
+  const cameraFocus = new THREE.Vector3();
+  const cameraTargetFocus = new THREE.Vector3();
+  const cameraAnchor = new THREE.Vector3();
+  const cameraTargetAnchor = new THREE.Vector3();
+  const cameraDir = new THREE.Vector3(1, 0.45, 1).normalize();
+  const cameraOrbitDir = new THREE.Vector3();
+  const cameraDesiredDir = new THREE.Vector3();
+  const cameraLookTarget = new THREE.Vector3();
+  const ORIGIN = new THREE.Vector3();
+  const cameraTrackDir = new THREE.Vector3();
+  let cameraHasTrackDir = false;
+  let cameraTrackStrength = 0;
+  let cameraUrgency = 0;
+  let cameraDistance = 8.0;
+  let cameraTargetDistance = 8.0;
+  let cameraHasTarget = false;
+
+  function setObjective(dir) {
+    objLight.position.copy(dir).multiplyScalar(10);
+    fillLight.position.copy(dir).multiplyScalar(-10);
+  }
+
+  function focusOn(pos, strength = CAMERA_TRACK_STRENGTH, urgency = 0.55, plannedDir = null, distance = null, anchor = null) {
+    if (!pos) {
+      cameraTargetFocus.set(0, 0, 0);
+      cameraTargetAnchor.set(0, 0, 0);
+      cameraHasTarget = false;
+      cameraTrackStrength = 0;
+      cameraUrgency = 0;
+      cameraHasTrackDir = false;
+      cameraTargetDistance = 8.0;
+      return;
+    }
+
+    cameraUrgency = urgency;
+    cameraHasTarget = true;
+    cameraTargetFocus.copy(pos);
+    cameraTargetAnchor.copy(anchor ?? pos);
+    cameraTrackStrength = strength;
+    if (distance != null) cameraTargetDistance = distance;
+
+    if (plannedDir) {
+      cameraTrackDir.copy(plannedDir).normalize();
+      cameraHasTrackDir = true;
+    } else {
+      cameraHasTrackDir = false;
+    }
+  }
+
+  let orbitAngle = 0;
+  let tiltPhase  = 0;
+  function updateCamera(dt) {
+    orbitAngle = (orbitAngle + (CAMERA_ORBIT_DEG_S * Math.PI/180) * dt) % TAU;
+    tiltPhase  = (tiltPhase  + (TAU / CAMERA_TILT_PERIOD_S) * dt) % TAU;
+    const tilt = (24*Math.PI/180) + Math.sin(tiltPhase) * (12*Math.PI/180);
+    cameraOrbitDir.set(
+      Math.cos(orbitAngle)*Math.cos(tilt),
+      Math.sin(tilt),
+      Math.sin(orbitAngle)*Math.cos(tilt)
+    );
+    if (cameraHasTrackDir) {
+      slerpVec3Into(cameraDesiredDir, cameraOrbitDir, cameraTrackDir, cameraTrackStrength);
+    } else {
+      cameraDesiredDir.copy(cameraOrbitDir);
+    }
+
+    const focusRate = cameraHasTarget ? 3.8 + 3.0 * cameraUrgency : 1.6;
+    const dirRate = cameraHasTrackDir ? 1.4 + 4.0 * cameraUrgency : 0.9;
+    cameraFocus.lerp(cameraTargetFocus, damp(focusRate, dt));
+    cameraAnchor.lerp(cameraTargetAnchor, damp(2.8 + 2.2 * cameraUrgency, dt));
+    slerpVec3Into(cameraDir, cameraDir, cameraDesiredDir, damp(dirRate, dt));
+    cameraDistance += (cameraTargetDistance - cameraDistance) * damp(2.4 + 2.2 * cameraUrgency, dt);
+
+    cameraLookTarget.copy(cameraFocus).lerp(ORIGIN, CAMERA_LOOK_ORIGIN_BIAS);
+    camera.position.copy(cameraDir).multiplyScalar(cameraDistance).add(cameraAnchor);
+    camera.lookAt(cameraLookTarget);
+  }
+
+  function onResize() {
+    camera.aspect = innerWidth/innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+    composer.setSize(innerWidth, innerHeight);
+  }
+  window.addEventListener('resize', onResize);
+  onResize(); // apply on initial load
+
+  document.addEventListener('keydown', e => {
+    if (e.key.toLowerCase() === 'f') {
+      document.fullscreenElement
+        ? document.exitFullscreen()
+        : document.documentElement.requestFullscreen();
+    }
+  });
+
+  function render() { composer.render(); }
+
+  function cameraDirection() { return cameraDir.clone(); }
+
+  return { scene, camera, cameraDirection, setObjective, focusOn, updateCamera, render };
+})();
+
+// ── Polytope ──────────────────────────────────────────────────────────────────
+const Polytope = (() => {
+  let faceMat  = null;
+  let edgeMat  = null;
+  let faceMesh = null;
+  let edgeMesh = null;
+  let vSpheres = [];
+  let vBaseColors = [];
+  let vBaseRanks = [];
+  let trailSegs = [];
+  let hopTrail  = null; // active growing trail during HOP
+  let hintSegs  = [];
+  let consideredVertices = new Map();
+  let optimumHalo = null;
+  const vertexGeo = new THREE.SphereGeometry(0.052, 12, 12);
+  const WHITE_COLOR = new THREE.Color(0xffffff);
+  const CANDIDATE_COLOR = new THREE.Color(0xffc857);
+  const BLOCKED_COLOR = new THREE.Color(0x6f86a8);
+  const OPTIMUM_COLOR = new THREE.Color(0xfff1b8);
+
+  // Persistent cursor sphere — the moving "current vertex" indicator
+  const cursorMesh = new THREE.Mesh(
+    new THREE.SphereGeometry(0.105, 16, 16),
+    new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 1.0,
+      depthTest: false,
+      depthWrite: false
+    })
+  );
+  cursorMesh.visible = false;
+  cursorMesh.renderOrder = 6;
+  SceneRenderer.scene.add(cursorMesh);
+
+  function _removeGeom(obj) {
+    if (!obj) return;
+    SceneRenderer.scene.remove(obj);
+    obj.geometry?.dispose();
+  }
+
+  function removeVertexSphere(s) {
+    SceneRenderer.scene.remove(s);
+    s.material?.dispose();
+  }
+
+  function scoreColors(objVals) {
+    if (!objVals?.length) {
+      vBaseRanks = [];
+      return [];
+    }
+    const order = [...Array(objVals.length).keys()].sort((a,b) => objVals[a]-objVals[b]);
+    const rank = Array(objVals.length).fill(0);
+    order.forEach((idx, i) => { rank[idx] = order.length === 1 ? 1 : i / (order.length - 1); });
+    vBaseRanks = rank;
+    return rank.map(t => {
+      const x = Math.pow(t, 0.58);
+      if (x < 0.52) return new THREE.Color().lerpColors(SCORE_LOW_COLOR, SCORE_MID_COLOR, x / 0.52);
+      if (x < 0.90) return new THREE.Color().lerpColors(SCORE_MID_COLOR, SCORE_HIGH_COLOR, (x - 0.52) / 0.38);
+      return new THREE.Color().lerpColors(SCORE_HIGH_COLOR, SCORE_OPT_COLOR, (x - 0.90) / 0.10);
+    });
+  }
+
+  function makeVertexSphere(pos, idx) {
+    const base = vBaseColors[idx] ?? new THREE.Color(0x888888);
+    const rank = vBaseRanks[idx] ?? 0;
+    const s = new THREE.Mesh(
+      vertexGeo,
+      new THREE.MeshBasicMaterial({
+        color: base,
+        transparent: true,
+        opacity: 0.24 + 0.24 * rank,
+        depthWrite: false
+      })
+    );
+    s.scale.setScalar(0.82 + 0.24 * Math.pow(rank, 2.2));
+    s.position.copy(pos);
+    SceneRenderer.scene.add(s);
+    vSpheres.push(s);
+  }
+
+  // Build fresh polytope geometry + vertex spheres. Creates new materials.
+  function build(vertices, color, objVals = []) {
+    _removeGeom(faceMesh);
+    _removeGeom(edgeMesh);
+    vSpheres.forEach(removeVertexSphere);
+    vSpheres = [];
+    vBaseColors = scoreColors(objVals);
+    faceMat?.dispose();
+    edgeMat?.dispose();
+
+    faceMat = new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.18,
+      side: THREE.DoubleSide,
+      depthWrite: false
+    });
+    edgeMat = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.36 });
+
+    const cGeo  = new ConvexGeometry(vertices);
+    faceMesh = new THREE.Mesh(cGeo, faceMat);
+    edgeMesh = new THREE.LineSegments(new THREE.EdgesGeometry(cGeo), edgeMat);
+    SceneRenderer.scene.add(faceMesh);
+    SceneRenderer.scene.add(edgeMesh);
+
+    vertices.forEach(makeVertexSphere);
+  }
+
+  // Rebuild geometry only (reuse existing faceMat/edgeMat) — used during transitions.
+  function updateGeometry(vertices, objVals = []) {
+    if (!faceMat || !edgeMat) return;
+    _removeGeom(faceMesh);
+    _removeGeom(edgeMesh);
+    vSpheres.forEach(removeVertexSphere);
+    vSpheres = [];
+    vBaseColors = scoreColors(objVals);
+
+    const cGeo  = new ConvexGeometry(vertices);
+    faceMesh = new THREE.Mesh(cGeo, faceMat);
+    edgeMesh = new THREE.LineSegments(new THREE.EdgesGeometry(cGeo), edgeMat);
+    SceneRenderer.scene.add(faceMesh);
+    SceneRenderer.scene.add(edgeMesh);
+
+    vertices.forEach(makeVertexSphere);
+  }
+
+  // Blend face and edge colour — called each frame during TRANSITIONING.
+  function blendColor(c1, c2, t) {
+    faceMat?.color.lerpColors(c1, c2, t);
+    edgeMat?.color.lerpColors(c1, c2, t);
+  }
+
+  function setCursor(pos, visible = true) {
+    cursorMesh.visible = visible;
+    if (visible) {
+      cursorMesh.position.copy(pos);
+      cursorMesh.scale.setScalar(1);
+      cursorMesh.material.opacity = 1.0;
+    }
+  }
+
+  function distToScreenSegment(p, a, b) {
+    const abx = b.x - a.x;
+    const aby = b.y - a.y;
+    const apx = p.x - a.x;
+    const apy = p.y - a.y;
+    const lenSq = abx*abx + aby*aby;
+    const u = lenSq > 1e-8 ? Math.max(0, Math.min(1, (apx*abx + apy*aby) / lenSq)) : 0;
+    const dx = p.x - (a.x + abx*u);
+    const dy = p.y - (a.y + aby*u);
+    return Math.sqrt(dx*dx + dy*dy);
+  }
+
+  function setFocus(vertices, currentIdx, nextIdx, visited = [], cursorPos = null) {
+    if (!vertices?.length) return;
+
+    const camera = SceneRenderer.camera;
+    const current = currentIdx == null ? null : vertices[currentIdx];
+    const next = nextIdx == null ? null : vertices[nextIdx];
+    const relevant = new Set(visited);
+    if (currentIdx != null) relevant.add(currentIdx);
+    if (nextIdx != null) relevant.add(nextIdx);
+
+    const cursorScreen = (cursorPos ?? current ?? new THREE.Vector3()).clone().project(camera);
+    const currentScreen = current ? current.clone().project(camera) : cursorScreen;
+    const nextScreen = next ? next.clone().project(camera) : cursorScreen;
+
+    for (let i = 0; i < vSpheres.length; i++) {
+      const s = vSpheres[i];
+      if (!s) continue;
+      const rank = vBaseRanks[i] ?? 0;
+      const base = vBaseColors[i] ?? new THREE.Color(0x888888);
+      const projected = vertices[i].clone().project(camera);
+      const nearCursor = Math.hypot(projected.x - cursorScreen.x, projected.y - cursorScreen.y) < 0.105;
+      const nearActiveEdge = next ? distToScreenSegment(projected, currentScreen, nextScreen) < 0.075 : false;
+      const behindCursor = projected.z > cursorScreen.z + 0.025;
+      const isCurrent = i === currentIdx;
+      const isNext = i === nextIdx;
+      const isRelevant = relevant.has(i);
+      const consideration = consideredVertices.get(i);
+
+      let opacity = 0.22 + 0.22 * rank;
+      let scale = 0.78 + 0.22 * Math.pow(rank, 2.2);
+
+      if (!isRelevant && (nearCursor || nearActiveEdge)) opacity *= 0.28;
+      if (!isRelevant && behindCursor) opacity *= 0.55;
+      if (consideration === 'candidate') { opacity = Math.max(opacity, 0.74); scale = Math.max(scale, 1.18); }
+      if (consideration === 'blocked') { opacity = Math.max(opacity, 0.48); scale = Math.max(scale, 1.02); }
+      if (isRelevant) opacity = Math.max(opacity, 0.50);
+      if (isNext) { opacity = 0.86; scale = 1.28; }
+      if (isCurrent) { opacity = 1.0; scale = 1.55; }
+
+      s.material.color.copy(base);
+      if (consideration === 'blocked') s.material.color.lerp(BLOCKED_COLOR, 0.72);
+      if (consideration === 'candidate') s.material.color.lerp(CANDIDATE_COLOR, 0.78);
+      if (isRelevant) s.material.color.lerp(WHITE_COLOR, isCurrent ? 0.72 : 0.34);
+      if (isNext) s.material.color.copy(WHITE_COLOR);
+      s.material.opacity = Math.max(0.035, Math.min(1, opacity));
+      s.scale.setScalar(scale);
+    }
+  }
+
+  // state: 'default' | 'visited' | 'optimal'
+  function setVertexState(idx, state) {
+    const s = vSpheres[idx];
+    if (!s) return;
+    const base = vBaseColors[idx] ?? new THREE.Color(0x888888);
+    if (state === 'default') {
+      s.scale.setScalar(1);   s.material.color.copy(base); s.material.opacity = 0.34;
+    } else if (state === 'visited') {
+      s.scale.setScalar(1.18); s.material.color.copy(base).lerp(WHITE_COLOR, 0.26); s.material.opacity = 0.58;
+    } else if (state === 'optimal') {
+      s.scale.setScalar(1.8); s.material.color.copy(OPTIMUM_COLOR); s.material.opacity = 1.0;
+    }
+  }
+
+  // t: 0→1 over AT_VERTEX_MS — sphere grows then settles
+  function pulseVertex(idx, t) {
+    const s = vSpheres[idx];
+    if (s) s.scale.setScalar(1.22 + 0.38 * Math.sin(t * Math.PI));
+  }
+
+  // Slow sinusoidal emissive pulse while at optimum
+  function pulseOptimal(idx, elapsed) {
+    const s = vSpheres[idx];
+    if (s) s.material.opacity = 0.7 + 0.3 * Math.sin(elapsed * 0.002 * 2 * Math.PI);
+    if (optimumHalo) {
+      const pulse = 1 + 0.10 * Math.sin(elapsed * 0.004 * 2 * Math.PI);
+      optimumHalo.mesh.scale.setScalar(pulse);
+      optimumHalo.mesh.rotation.z += 0.012;
+      optimumHalo.mesh.rotation.x += 0.006;
+      optimumHalo.mat.opacity = 0.42 + 0.22 * Math.sin(elapsed * 0.0025 * 2 * Math.PI);
+      optimumHalo.outerMesh.scale.setScalar(1.08 + 0.08 * Math.sin(elapsed * 0.003 * 2 * Math.PI));
+      optimumHalo.outerMesh.rotation.y += 0.007;
+      optimumHalo.outerMat.opacity = 0.20 + 0.12 * Math.sin(elapsed * 0.002 * 2 * Math.PI);
+    }
+  }
+
+  // Progressive trail: cursor leaves a growing cylinder behind it during HOP.
+  // startTrail → growTrail each frame → finishTrail hands it to the fade array.
+  function startTrail(from, to) {
+    const dirRaw = new THREE.Vector3().subVectors(to, from);
+    const len    = dirRaw.length();
+    if (len < 1e-6) return;
+    const dir = dirRaw.normalize();
+    const geo = new THREE.CylinderGeometry(0.015, 0.015, len, 6);
+    const mat = new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.95,
+      depthTest: false,
+      depthWrite: false
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.copy(from);
+    mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+    mesh.scale.y = 0.001;
+    SceneRenderer.scene.add(mesh);
+    hopTrail = { mesh, mat, from: from.clone(), dir, len };
+  }
+
+  function growTrail(t) {
+    if (!hopTrail) return;
+    const s = Math.max(0.001, t);
+    hopTrail.mesh.scale.y = s;
+    // Shift center so the trail grows from `from` toward `to`
+    hopTrail.mesh.position.copy(hopTrail.from).addScaledVector(hopTrail.dir, s * hopTrail.len / 2);
+  }
+
+  function finishTrail() {
+    if (!hopTrail) return;
+    hopTrail.mesh.scale.y = 1;
+    hopTrail.mesh.position.copy(hopTrail.from).addScaledVector(hopTrail.dir, hopTrail.len / 2);
+    trailSegs.push({ mesh: hopTrail.mesh, mat: hopTrail.mat, born: performance.now(), fading: false });
+    hopTrail = null;
+  }
+
+  function beginTrailFade(now = performance.now()) {
+    for (const seg of trailSegs) {
+      if (!seg.fading) {
+        seg.fading = true;
+        seg.fadeBorn = now;
+      }
+    }
+  }
+
+  function makeEdgeSegment(from, to, color, radius, opacity, kind = 'hint') {
+    const dirRaw = new THREE.Vector3().subVectors(to, from);
+    const len = dirRaw.length();
+    if (len < 1e-6) return null;
+    const dir = dirRaw.normalize();
+    const geo = new THREE.CylinderGeometry(radius, radius, len, 6);
+    const mat = new THREE.MeshBasicMaterial({
+      color, transparent: true, opacity,
+      depthTest: false, depthWrite: false
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.copy(from).addScaledVector(dir, len / 2);
+    mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+    mesh.renderOrder = 4;
+    SceneRenderer.scene.add(mesh);
+    return { mesh, mat, baseOpacity: opacity, kind };
+  }
+
+  function clearHints() {
+    for (const { mesh, mat } of hintSegs) {
+      SceneRenderer.scene.remove(mesh);
+      mesh.geometry.dispose();
+      mat.dispose();
+    }
+    hintSegs = [];
+    consideredVertices.clear();
+  }
+
+  function showImprovingEdges(vertices, fromIdx, improving, chosenIdx) {
+    clearHints();
+    const from = vertices[fromIdx];
+    for (const idx of improving) {
+      const isChosen = idx === chosenIdx;
+      const len = from.distanceTo(vertices[idx]);
+      if (len < MIN_SIMPLEX_EDGE_LEN) continue;
+      consideredVertices.set(idx, isChosen ? 'chosen' : 'candidate');
+      const seg = makeEdgeSegment(
+        from, vertices[idx],
+        isChosen ? 0xffffff : 0xffc857,
+        isChosen ? 0.022 : 0.009,
+        isChosen ? 0.86 : 0.30,
+        isChosen ? 'chosen' : 'candidate'
+      );
+      if (seg) hintSegs.push(seg);
+    }
+  }
+
+  function showBlockedEdges(vertices, fromIdx, blocked) {
+    clearHints();
+    const from = vertices[fromIdx];
+    for (const idx of blocked) {
+      consideredVertices.set(idx, 'blocked');
+      const seg = makeEdgeSegment(from, vertices[idx], 0x6f86a8, 0.010, 0.22);
+      if (seg) hintSegs.push(seg);
+    }
+  }
+
+  function pulseHints(t) {
+    const pulse = 0.60 + 0.40 * Math.sin(t * Math.PI);
+    for (const seg of hintSegs) {
+      if (seg.kind === 'candidate') {
+        const fade = t < 0.58 ? 1 : Math.max(0.14, 1 - (t - 0.58) / 0.42);
+        seg.mat.opacity = seg.baseOpacity * pulse * fade;
+      } else if (seg.kind === 'chosen') {
+        const surge = 0.65 + 0.55 * t;
+        seg.mat.opacity = Math.min(1, seg.baseOpacity * pulse * surge);
+        seg.mesh.scale.x = 1 + 0.12 * Math.sin(t * Math.PI);
+        seg.mesh.scale.z = seg.mesh.scale.x;
+      } else {
+        seg.mat.opacity = seg.baseOpacity * pulse;
+      }
+    }
+  }
+
+  function showOptimumHalo(pos) {
+    clearOptimumHalo();
+    const geo = new THREE.TorusGeometry(0.22, 0.010, 8, 64);
+    const mat = new THREE.MeshBasicMaterial({
+      color: 0xfff1b8,
+      transparent: true,
+      opacity: 0.55,
+      depthTest: false,
+      depthWrite: false
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.copy(pos);
+    mesh.renderOrder = 5;
+    SceneRenderer.scene.add(mesh);
+
+    const outerGeo = new THREE.TorusGeometry(0.34, 0.006, 8, 72);
+    const outerMat = new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.28,
+      depthTest: false,
+      depthWrite: false
+    });
+    const outerMesh = new THREE.Mesh(outerGeo, outerMat);
+    outerMesh.position.copy(pos);
+    outerMesh.rotation.x = Math.PI / 2;
+    outerMesh.renderOrder = 5;
+    SceneRenderer.scene.add(outerMesh);
+
+    optimumHalo = { mesh, mat, outerMesh, outerMat };
+  }
+
+  function clearOptimumHalo() {
+    if (!optimumHalo) return;
+    SceneRenderer.scene.remove(optimumHalo.mesh);
+    optimumHalo.mesh.geometry.dispose();
+    optimumHalo.mat.dispose();
+    SceneRenderer.scene.remove(optimumHalo.outerMesh);
+    optimumHalo.outerMesh.geometry.dispose();
+    optimumHalo.outerMat.dispose();
+    optimumHalo = null;
+  }
+
+  function updateTrails(now) {
+    for (let i = trailSegs.length-1; i >= 0; i--) {
+      const { mesh, mat, fading, fadeBorn } = trailSegs[i];
+      if (fading && now - fadeBorn > TRAIL_FADE_MS) {
+        SceneRenderer.scene.remove(mesh);
+        mesh.geometry.dispose();
+        mat.dispose();
+        trailSegs.splice(i, 1);
+      } else {
+        const recency = trailSegs.length <= 1 ? 1 : i / (trailSegs.length - 1);
+        const base = 0.22 + 0.58 * recency;
+        const fade = fading ? 1 - (now - fadeBorn) / TRAIL_FADE_MS : 1;
+        mat.opacity = Math.max(0, base * fade);
+        const width = 0.78 + 0.28 * recency;
+        mesh.scale.x = width;
+        mesh.scale.z = width;
+      }
+    }
+  }
+
+  function clearTrails() {
+    clearHints();
+    clearOptimumHalo();
+    if (hopTrail) {
+      SceneRenderer.scene.remove(hopTrail.mesh);
+      hopTrail.mesh.geometry.dispose();
+      hopTrail.mat.dispose();
+      hopTrail = null;
+    }
+    for (const { mesh, mat } of trailSegs) {
+      SceneRenderer.scene.remove(mesh);
+      mesh.geometry.dispose();
+      mat.dispose();
+    }
+    trailSegs = [];
+  }
+
+  function nextColor() {
+    const c = PALETTE[paletteIdx % PALETTE.length].clone();
+    paletteIdx++;
+    return c;
+  }
+
+  return {
+    build, updateGeometry, blendColor,
+    setCursor, setVertexState, pulseVertex, pulseOptimal,
+    startTrail, growTrail, finishTrail, updateTrails, clearTrails,
+    beginTrailFade, setFocus,
+    showImprovingEdges, showBlockedEdges, pulseHints, clearHints,
+    showOptimumHalo, clearOptimumHalo,
+    nextColor
+  };
+})();
+
+// ── Animator ──────────────────────────────────────────────────────────────────
+const Animator = (() => {
+  const S = {
+    BOOT:         'BOOT',
+    IDLE:         'IDLE',
+    EDGE_PREVIEW: 'EDGE_PREVIEW',
+    HOP:          'HOP',
+    AT_VERTEX:    'AT_VERTEX',
+    AT_OPTIMUM:   'AT_OPTIMUM',
+    TRANSITIONING:'TRANSITIONING',
+  };
+
+  let state  = S.BOOT;
+  let stateT = 0;
+  let lastT  = 0;
+
+  // Active LP + simplex state
+  let lp=null, en=null, path=null, step=0, activeColor=null;
+  let cameraPlan = [];
+  let trailStarted = false; // reset each time HOP is entered
+  let hintsStarted = false;
+  // Transition target
+  let nextLP=null, nextEn=null, nextColor=null, nextPath=null;
+  let nextCameraPlan = [];
+  let transitionFrames = [];
+  let lastTransitionFrameIdx = -1;
+  let activeCentroid = new THREE.Vector3();
+  let nextCentroid = new THREE.Vector3();
+  const cameraShotPoint = new THREE.Vector3();
+  const cameraShotAnchor = new THREE.Vector3();
+  const cameraShotDir = new THREE.Vector3();
+  let cameraShotDistance = 8.7;
+  let cameraShotStrength = CAMERA_TRACK_STRENGTH;
+  let cameraShotUrgency = 0;
+  let cameraShotHasDir = false;
+  let cameraShotReady = false;
+
+  const sceneBank = [];
+  let sceneBankIdx = -1;
+  const BANK_CAMERA_DIR = new THREE.Vector3(1, 0.44, 1).normalize();
+
+  // Neutral plane used to pad shorter constraint lists during transitions.
+  // Offset +10 contains the whole ±2 cube, so it never constrains.
+  const NEUTRAL_N = new THREE.Vector3(0, 0, 1);
+  const NEUTRAL_B = 10;
+
+  // ── Helpers ─────────────────────────────────────────────────────────────────
+
+  function centroidOf(vertices) {
+    const c = new THREE.Vector3();
+    if (!vertices?.length) return c;
+    for (const v of vertices) c.add(v);
+    return c.multiplyScalar(1 / vertices.length);
+  }
+
+  function projectedSpacingOK(vertices) {
+    const dirs = [];
+    for (let i = 0; i < 8; i++) {
+      const a = i * TAU / 8;
+      dirs.push(new THREE.Vector3(Math.cos(a), 0.48, Math.sin(a)).normalize());
+    }
+
+    for (const dir of dirs) {
+      const right = new THREE.Vector3().crossVectors(new THREE.Vector3(0, 1, 0), dir);
+      if (right.lengthSq() < 1e-5) right.crossVectors(new THREE.Vector3(1, 0, 0), dir);
+      right.normalize();
+      const up = new THREE.Vector3().crossVectors(dir, right).normalize();
+
+      let closePairs = 0;
+      for (let i = 0; i < vertices.length; i++) {
+        for (let j = i + 1; j < vertices.length; j++) {
+          const delta = new THREE.Vector3().subVectors(vertices[i], vertices[j]);
+          const projectedDist = Math.hypot(delta.dot(right), delta.dot(up));
+          if (projectedDist < 0.32) closePairs++;
+          if (closePairs > 4) return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  function visualQualityOK(en, path) {
+    const verts = en.vertices;
+    if (verts.length < 8 || verts.length > 22) return false;
+    if (!projectedSpacingOK(verts)) return false;
+    const optIdx = path[path.length - 1];
+    const optVal = Math.max(...en.objVals);
+    if (Math.abs(en.objVals[optIdx] - optVal) > 1e-5) return false;
+
+    const MIN_VERTEX_SEPARATION = 0.52;
+    for (let i = 0; i < verts.length; i++) {
+      for (let j = i + 1; j < verts.length; j++) {
+        if (verts[i].distanceTo(verts[j]) < MIN_VERTEX_SEPARATION) return false;
+      }
+    }
+
+    const MIN_VISIBLE_EDGE = 0.66;
+    for (let i = 0; i < verts.length; i++) {
+      for (const j of en.adj[i]) {
+        if (j > i && verts[i].distanceTo(verts[j]) < MIN_VISIBLE_EDGE) return false;
+      }
+    }
+
+    for (let k = 0; k < path.length - 1; k++) {
+      if (verts[path[k]].distanceTo(verts[path[k+1]]) < MIN_SIMPLEX_EDGE_LEN) return false;
+    }
+
+    return path.length >= 4 && path.length <= 9;
+  }
+
+  function buildCameraPlan(en, path, objective, initialDir = SceneRenderer.cameraDirection()) {
+    const up = new THREE.Vector3(0, 1, 0);
+    const obj = objective.clone().normalize();
+    let prev = initialDir.clone().normalize();
+    const plan = [];
+
+    for (let i = 0; i < path.length - 1; i++) {
+      const from = en.vertices[path[i]];
+      const to = en.vertices[path[i+1]];
+      const mid = new THREE.Vector3().addVectors(from, to).multiplyScalar(0.5);
+      const edge = new THREE.Vector3().subVectors(to, from).normalize();
+      const radial = mid.lengthSq() > 1e-5 ? mid.clone().normalize() : prev.clone();
+      const side = new THREE.Vector3().crossVectors(edge, up);
+      if (side.lengthSq() < 1e-5) side.crossVectors(edge, new THREE.Vector3(1, 0, 0));
+      side.normalize();
+
+      const candidates = [
+        radial,
+        radial.clone().addScaledVector(side, 0.75),
+        radial.clone().addScaledVector(side, -0.75),
+        obj.clone().addScaledVector(side, 0.65),
+        obj.clone().addScaledVector(side, -0.65),
+        prev.clone()
+      ].map(v => {
+        v.y += 0.28;
+        return v.normalize();
+      });
+
+      let best = candidates[0];
+      let bestScore = Infinity;
+      for (const dir of candidates) {
+        const foreshorten = Math.abs(dir.dot(edge));
+        const turn = 1 - Math.max(-1, Math.min(1, dir.dot(prev)));
+        const behind = Math.max(0, -dir.dot(radial));
+        const score = foreshorten * 2.2 + turn * 1.4 + behind * 1.8;
+        if (score < bestScore) { bestScore = score; best = dir; }
+      }
+
+      plan.push({ dir: best.clone(), target: mid });
+      prev = best.clone();
+    }
+    return plan;
+  }
+
+  function prepareScene(source = LP.generate) {
+    const l = source();
+    const e = VertexEnum.enumerate(l);
+    if (!e) return null;
+    const p = Simplex.solve(e);
+    if (!p || p.length < 4) return null;
+    if (!visualQualityOK(e, p)) return null;
+    return {
+      lp: l,
+      en: e,
+      path: p,
+      centroid: centroidOf(e.vertices),
+      cameraPlan: buildCameraPlan(e, p, l.objective, BANK_CAMERA_DIR)
+    };
+  }
+
+  function buildSceneBank() {
+    sceneBank.length = 0;
+
+    for (let i = 0; i < 900 && sceneBank.length < SCENE_BANK_SIZE; i++) {
+      const scene = prepareScene(LP.generateCurated);
+      if (scene) sceneBank.push(scene);
+    }
+
+    for (let i = 0; i < 5000 && sceneBank.length < SCENE_BANK_SIZE; i++) {
+      const scene = prepareScene(LP.generate);
+      if (scene) sceneBank.push(scene);
+    }
+  }
+
+  function nextBankScene() {
+    if (sceneBank.length) {
+      sceneBankIdx = (sceneBankIdx + 1) % sceneBank.length;
+      return sceneBank[sceneBankIdx];
+    }
+    return generateValidLP();
+  }
+
+  function useScene(scene) {
+    lp = scene.lp;
+    en = scene.en;
+    path = scene.path;
+    activeCentroid.copy(scene.centroid ?? centroidOf(en.vertices));
+    cameraPlan = scene.cameraPlan ?? buildCameraPlan(en, path, lp.objective);
+    step = 0;
+  }
+
+  function useNextScene(scene) {
+    nextLP = scene.lp;
+    nextEn = scene.en;
+    nextPath = scene.path;
+    nextCentroid.copy(scene.centroid ?? centroidOf(nextEn.vertices));
+    nextCameraPlan = scene.cameraPlan ?? buildCameraPlan(nextEn, nextPath, nextLP.objective);
+  }
+
+  // Returns { lp, en, path } for a non-cube LP with a visibly multi-step simplex path.
+  // Quality gates relax at the end instead of falling back to a plain cube.
+  function generateValidLP() {
+    for (let i = 0; i < 160; i++) {
+      const l = LP.generateCurated();
+      const e = VertexEnum.enumerate(l);
+      if (!e) continue;
+      const p = Simplex.solve(e);
+      if (!p || p.length < 4) continue; // require at least 3 hops
+      if (!visualQualityOK(e, p)) continue;
+      return { lp: l, en: e, path: p, centroid: centroidOf(e.vertices) };
+    }
+    for (let i = 0; i < 1000; i++) {
+      const l = LP.generate();
+      const e = VertexEnum.enumerate(l);
+      if (!e) continue;
+      const p = Simplex.solve(e);
+      if (!p || p.length < 4) continue; // require at least 3 hops
+      if (!visualQualityOK(e, p)) continue;
+      return { lp: l, en: e, path: p, centroid: centroidOf(e.vertices) };
+    }
+    for (let i = 0; i < 3000; i++) {
+      const l = LP.generate();
+      const e = VertexEnum.enumerate(l);
+      if (!e || e.vertices.length <= 8 || e.vertices.length > 22 || !projectedSpacingOK(e.vertices)) continue;
+      const p = Simplex.solve(e);
+      if (!p || p.length < 3) continue;
+      return { lp: l, en: e, path: p, centroid: centroidOf(e.vertices) };
+    }
+    for (let i = 0; i < 6000; i++) {
+      const l = LP.generate();
+      const e = VertexEnum.enumerate(l);
+      if (!e || e.vertices.length < 4) continue;
+      const p = Simplex.solve(e);
+      if (!p || p.length < 2) continue;
+      return { lp: l, en: e, path: p, centroid: centroidOf(e.vertices) };
+    }
+    throw new Error('Unable to generate a simplex scene');
+  }
+
+  // Interpolate constraint planes at lerp parameter t ∈ [0,1].
+  // Cube cage (first 6) stays fixed; random constraints slerp normals, lerp offsets.
+  function interpConstraints(fromLp, toLp, t) {
+    const cs    = fromLp.constraints.slice(0, 6); // cube cage unchanged
+    const fromR = fromLp.constraints.slice(6);
+    const toR   = toLp.constraints.slice(6);
+    const tracks = Math.max(fromR.length, toR.length);
+    for (let i = 0; i < tracks; i++) {
+      const a = fromR[i] ?? { n: NEUTRAL_N, b: NEUTRAL_B };
+      const b = toR[i]   ?? { n: NEUTRAL_N, b: NEUTRAL_B };
+      cs.push({
+        n: slerpVec3(a.n, b.n, t),
+        b: a.b + (b.b - a.b) * t
+      });
+    }
+    return cs;
+  }
+
+  function buildTransitionFrames(fromLp, toLp) {
+    const frames = [];
+    const count = Math.max(2, Math.ceil((TRANSITION_MS / 1000) * TRANSITION_SAMPLE_FPS));
+    let last = null;
+
+    for (let i = 0; i < count; i++) {
+      const u = i / (count - 1);
+      const interpCs = interpConstraints(fromLp, toLp, easeInOutCubic(u));
+      const tempLP = { constraints: interpCs, objective: toLp.objective };
+      const tempEn = VertexEnum.enumerate(tempLP);
+      if (tempEn) {
+        last = { vertices: tempEn.vertices, objVals: tempEn.objVals };
+      }
+      if (last) frames.push(last);
+    }
+
+    if (!frames.length && nextEn) {
+      frames.push({ vertices: nextEn.vertices, objVals: nextEn.objVals });
+    }
+    return frames;
+  }
+
+  function outgoingFrom(vertexIdx) {
+    if (!en || vertexIdx == null) return [];
+    const improving = en.adj[vertexIdx]
+      .filter(nb => en.objVals[nb] > en.objVals[vertexIdx] + 1e-9)
+      .filter(nb => en.vertices[vertexIdx].distanceTo(en.vertices[nb]) >= MIN_SIMPLEX_EDGE_LEN);
+    return improving.length ? improving : en.adj[vertexIdx];
+  }
+
+  function evaluationDir(vertexIdx) {
+    if (!en || vertexIdx == null) return SceneRenderer.cameraDirection();
+    const v = en.vertices[vertexIdx];
+    const sum = new THREE.Vector3();
+    for (const nb of outgoingFrom(vertexIdx)) {
+      sum.add(new THREE.Vector3().subVectors(en.vertices[nb], v).normalize());
+    }
+
+    const dir = sum.lengthSq() > 1e-5
+      ? sum.multiplyScalar(-1).normalize()
+      : new THREE.Vector3().subVectors(v, activeCentroid).normalize();
+    dir.y += 0.34;
+    return dir.normalize();
+  }
+
+  function localCameraDistance(vertexIdx) {
+    if (!en || vertexIdx == null) return 6.0;
+    const v = en.vertices[vertexIdx];
+    let longest = MIN_SIMPLEX_EDGE_LEN;
+    for (const nb of outgoingFrom(vertexIdx)) {
+      longest = Math.max(longest, v.distanceTo(en.vertices[nb]));
+    }
+    return Math.max(7.1, Math.min(10.4, longest * 4.45));
+  }
+
+  function cappedDir(ideal, maxDegrees = 30) {
+    if (!ideal) return null;
+    const current = SceneRenderer.cameraDirection();
+    const dot = Math.max(-1, Math.min(1, current.dot(ideal)));
+    const angle = Math.acos(dot);
+    // Smooth ±5° band around the threshold: orbit drift was crossing a hard
+    // boundary every cycle and snapping the camera target. Now the target
+    // ramps from "current" to "ideal" across the band, so no per-cycle wobble.
+    const inner = (maxDegrees - 5) * Math.PI / 180;
+    const outer = (maxDegrees + 5) * Math.PI / 180;
+    if (angle <= inner) return current;
+    if (angle >= outer) return ideal;
+    return slerpVec3(current, ideal, (angle - inner) / (outer - inner));
+  }
+
+  function pathCameraDir(progress = 0) {
+    if (!cameraPlan.length) return SceneRenderer.cameraDirection();
+    const cur = cameraPlan[Math.min(step, cameraPlan.length - 1)]?.dir;
+    const next = cameraPlan[Math.min(step + 1, cameraPlan.length - 1)]?.dir ?? cur;
+    if (!cur || !next) return SceneRenderer.cameraDirection();
+    const handoff = Math.max(0, Math.min(1, (progress - 0.45) / 0.55));
+    return cappedDir(slerpVec3(cur, next, handoff), 42);
+  }
+
+  function activeCameraShot(elapsed) {
+    if (state === S.TRANSITIONING && nextEn && nextPath) {
+      const t = Math.min(elapsed / TRANSITION_MS, 1);
+      const point = new THREE.Vector3().lerpVectors(activeCentroid, nextCentroid, easeInOutCubic(t));
+      return {
+        point,
+        anchor: point,
+        distance: 8.2,
+        urgency: 0.08
+      };
+    }
+    if (!en || !path) return null;
+    if (state === S.EDGE_PREVIEW && step < path.length - 1) {
+      return {
+        point: activeCentroid,
+        anchor: activeCentroid,
+        dir: pathCameraDir(Math.min(elapsed / EDGE_PREVIEW_MS, 1) * 0.35),
+        strength: 0.30,
+        distance: 8.5,
+        urgency: 0.18
+      };
+    }
+    if (state === S.HOP && step < path.length - 1) {
+      return {
+        point: activeCentroid,
+        anchor: activeCentroid,
+        dir: pathCameraDir(easeInOutCubic(Math.min(elapsed / HOP_DURATION_MS, 1))),
+        strength: 0.44,
+        distance: 8.3,
+        urgency: 0.30
+      };
+    }
+    if (state === S.AT_VERTEX && step < path.length) {
+      return {
+        point: activeCentroid,
+        anchor: activeCentroid,
+        dir: pathCameraDir(Math.min(elapsed / AT_VERTEX_MS, 1)),
+        strength: 0.34,
+        distance: 8.5,
+        urgency: 0.22
+      };
+    }
+    return {
+      point: activeCentroid,
+      anchor: activeCentroid,
+      distance: 8.7,
+      urgency: 0.08
+    };
+  }
+
+  function smoothCameraShot(shot, dt) {
+    if (!shot?.point) {
+      cameraShotReady = false;
+      cameraShotHasDir = false;
+      return null;
+    }
+
+    const targetAnchor = shot.anchor ?? shot.point;
+    const targetStrength = shot.strength ?? CAMERA_TRACK_STRENGTH;
+    const targetUrgency = shot.urgency ?? 0;
+    const targetDistance = shot.distance ?? 8.7;
+
+    if (!cameraShotReady) {
+      cameraShotPoint.copy(shot.point);
+      cameraShotAnchor.copy(targetAnchor);
+      if (shot.dir) {
+        cameraShotDir.copy(shot.dir);
+        cameraShotHasDir = true;
+      } else {
+        cameraShotHasDir = false;
+      }
+      cameraShotDistance = targetDistance;
+      cameraShotStrength = targetStrength;
+      cameraShotUrgency = targetUrgency;
+      cameraShotReady = true;
+    } else {
+      const response = damp(2.6 + 2.8 * targetUrgency, dt);
+      cameraShotPoint.lerp(shot.point, response);
+      cameraShotAnchor.lerp(targetAnchor, damp(2.2 + 2.2 * targetUrgency, dt));
+      cameraShotDistance += (targetDistance - cameraShotDistance) * damp(2.0 + 2.0 * targetUrgency, dt);
+      cameraShotStrength += (targetStrength - cameraShotStrength) * damp(3.0, dt);
+      cameraShotUrgency += (targetUrgency - cameraShotUrgency) * damp(3.0, dt);
+
+      if (shot.dir) {
+        if (cameraShotHasDir) {
+          slerpVec3Into(cameraShotDir, cameraShotDir, shot.dir, damp(2.8 + 2.6 * targetUrgency, dt));
+        } else {
+          cameraShotDir.copy(shot.dir);
+          cameraShotHasDir = true;
+        }
+      } else {
+        cameraShotHasDir = false;
+      }
+    }
+
+    return {
+      point: cameraShotPoint,
+      anchor: cameraShotAnchor,
+      dir: cameraShotHasDir ? cameraShotDir : null,
+      distance: cameraShotDistance,
+      strength: cameraShotStrength,
+      urgency: cameraShotUrgency
+    };
+  }
+
+  function enter(s, now) {
+    state=s;
+    stateT=now;
+    if (s === S.HOP) trailStarted=false;
+    if (s === S.EDGE_PREVIEW || s === S.AT_OPTIMUM) hintsStarted=false;
+  }
+
+  // ── Main loop ────────────────────────────────────────────────────────────────
+  function tick(now) {
+    // Clamp dt: long synchronous stalls (e.g. buildTransitionFrames) push damp(rate, dt) → 1,
+    // which collapses smoothing into a single-frame snap. Cap at 50 ms (≈20 fps) to keep eases stable.
+    const dt      = Math.min((now - lastT) / 1000, 0.05);
+    lastT         = now;
+    const elapsed = now - stateT;
+
+    const shot = smoothCameraShot(activeCameraShot(elapsed), dt);
+    SceneRenderer.focusOn(
+      shot?.point,
+      shot?.strength ?? CAMERA_TRACK_STRENGTH,
+      shot?.urgency ?? 0,
+      shot?.dir,
+      shot?.distance,
+      shot?.anchor
+    );
+    SceneRenderer.updateCamera(dt);
+    Polytope.updateTrails(now);
+
+    switch (state) {
+
+      case S.BOOT: {
+        buildSceneBank();
+        useScene(nextBankScene());
+        activeColor = Polytope.nextColor();
+        Polytope.build(en.vertices, activeColor, en.objVals);
+        Polytope.setCursor(en.vertices[path[0]]);
+        SceneRenderer.setObjective(lp.objective);
+        enter(S.IDLE, now);
+        break;
+      }
+
+      case S.IDLE: {
+        if (elapsed >= SIMPLEX_IDLE_MS) enter(S.EDGE_PREVIEW, now);
+        break;
+      }
+
+      case S.EDGE_PREVIEW: {
+        if (step >= path.length - 1) { enter(S.AT_OPTIMUM, now); break; }
+        if (!hintsStarted) {
+          const cur = path[step];
+          const next = path[step+1];
+          const improving = en.adj[cur]
+            .filter(nb => en.objVals[nb] > en.objVals[cur] + 1e-9)
+            .filter(nb => en.vertices[cur].distanceTo(en.vertices[nb]) >= MIN_SIMPLEX_EDGE_LEN)
+            .sort((a,b) => en.objVals[a]-en.objVals[b]);
+          Polytope.showImprovingEdges(en.vertices, cur, improving, next);
+          hintsStarted = true;
+        }
+        Polytope.setFocus(en.vertices, path[step], path[step+1], path.slice(0, step + 1), en.vertices[path[step]]);
+        Polytope.pulseHints(Math.min(elapsed / EDGE_PREVIEW_MS, 1));
+        if (elapsed >= EDGE_PREVIEW_MS) enter(S.HOP, now);
+        break;
+      }
+
+      case S.HOP: {
+        if (step >= path.length - 1) { enter(S.AT_OPTIMUM, now); break; }
+        const fromPos = en.vertices[path[step]];
+        const toPos   = en.vertices[path[step+1]];
+        const t       = easeInOutCubic(Math.min(elapsed / HOP_DURATION_MS, 1));
+
+        if (!trailStarted) {
+          Polytope.clearHints();
+          Polytope.startTrail(fromPos, toPos);
+          trailStarted = true;
+        }
+        Polytope.growTrail(t);
+        const cursorPos = new THREE.Vector3().lerpVectors(fromPos, toPos, t);
+        Polytope.setCursor(cursorPos);
+        Polytope.setFocus(en.vertices, path[step], path[step+1], path.slice(0, step + 1), cursorPos);
+
+        if (elapsed >= HOP_DURATION_MS) {
+          Polytope.finishTrail();
+          Polytope.setVertexState(path[step], 'visited');
+          step++;
+          Polytope.setCursor(en.vertices[path[step]]);
+          enter(S.AT_VERTEX, now);
+        }
+        break;
+      }
+
+      case S.AT_VERTEX: {
+        Polytope.setFocus(en.vertices, path[step], path[step+1], path.slice(0, step + 1), en.vertices[path[step]]);
+        Polytope.pulseVertex(path[step], elapsed / AT_VERTEX_MS);
+        if (elapsed >= AT_VERTEX_MS) {
+          const isOptimal = step >= path.length-1;
+          Polytope.setVertexState(path[step], isOptimal ? 'optimal' : 'visited');
+          enter(isOptimal ? S.AT_OPTIMUM : S.EDGE_PREVIEW, now);
+        }
+        break;
+      }
+
+      case S.AT_OPTIMUM: {
+        if (!hintsStarted) {
+          const opt = path[path.length-1];
+          const blocked = en.adj[opt]
+            .filter(nb => en.objVals[nb] <= en.objVals[opt] + 1e-9);
+          Polytope.showBlockedEdges(en.vertices, opt, blocked);
+          Polytope.showOptimumHalo(en.vertices[opt]);
+          Polytope.beginTrailFade(now);
+          hintsStarted = true;
+        }
+        Polytope.setFocus(en.vertices, path[path.length-1], null, path, en.vertices[path[path.length-1]]);
+        Polytope.pulseHints(Math.min(elapsed / AT_OPTIMUM_MS, 1));
+        Polytope.pulseOptimal(path[path.length-1], elapsed);
+        if (elapsed >= AT_OPTIMUM_MS) {
+          useNextScene(nextBankScene());
+          nextColor = Polytope.nextColor();
+          transitionFrames = buildTransitionFrames(lp, nextLP);
+          lastTransitionFrameIdx = -1;
+          Polytope.clearTrails();
+          Polytope.clearHints();
+          Polytope.setCursor(new THREE.Vector3(), false);
+          enter(S.TRANSITIONING, now);
+        }
+        break;
+      }
+
+      case S.TRANSITIONING: {
+        const progress = Math.min(elapsed / TRANSITION_MS, 1);
+        const t        = easeInOutCubic(progress);
+        const frameIdx = Math.min(
+          transitionFrames.length - 1,
+          Math.floor(progress * Math.max(0, transitionFrames.length - 1))
+        );
+        const frame = transitionFrames[frameIdx];
+        if (frame && frameIdx !== lastTransitionFrameIdx) {
+          Polytope.updateGeometry(frame.vertices, frame.objVals);
+          lastTransitionFrameIdx = frameIdx;
+        }
+        Polytope.blendColor(activeColor, nextColor, t);
+        SceneRenderer.setObjective(slerpVec3(lp.objective, nextLP.objective, t));
+
+        if (elapsed >= TRANSITION_MS) {
+          lp          = nextLP;
+          en          = nextEn;
+          activeColor = nextColor;
+          path        = nextPath;
+          cameraPlan  = nextCameraPlan;
+          activeCentroid.copy(nextCentroid);
+          step        = 0;
+          nextLP = nextEn = nextColor = nextPath = null;
+          nextCameraPlan = [];
+          transitionFrames = [];
+          Polytope.build(en.vertices, activeColor, en.objVals);
+          Polytope.setCursor(en.vertices[path[0]]);
+          SceneRenderer.setObjective(lp.objective);
+          enter(S.IDLE, now);
+        }
+        break;
+      }
+    }
+
+    SceneRenderer.render();
+    requestAnimationFrame(tick);
+  }
+
+  function start() {
+    lastT = performance.now();
+    requestAnimationFrame(tick);
+  }
+
+  return { start };
+})();
+
+// ── Boot ─────────────────────────────────────────────────────────────────────
+Animator.start();
+
+</script>
+</body>
+</html>
