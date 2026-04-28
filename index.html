@@ -320,21 +320,13 @@ const Simplex = (() => {
       if (improving.length === 0) break;
 
       improving.sort((a, b) => {
-        const da = vertices[cur].distanceTo(vertices[a]);
-        const db = vertices[cur].distanceTo(vertices[b]);
-
         const improveA = objVals[a] - objVals[cur];
         const improveB = objVals[b] - objVals[cur];
+        if (Math.abs(improveB - improveA) > 1e-9) return improveB - improveA;
 
-        // Strongly penalize short / visually bad pivots.
-        const shortPenaltyA = da < MIN_SIMPLEX_EDGE_LEN ? 1000 : 0;
-        const shortPenaltyB = db < MIN_SIMPLEX_EDGE_LEN ? 1000 : 0;
-
-        // Prefer larger visible moves, then larger objective improvement.
-        const scoreA = shortPenaltyA - da * 2.0 - improveA;
-        const scoreB = shortPenaltyB - db * 2.0 - improveB;
-
-        return scoreA - scoreB;
+        const da = vertices[cur].distanceTo(vertices[a]);
+        const db = vertices[cur].distanceTo(vertices[b]);
+        return db - da;
       });
 
       const next = improving[0];
@@ -806,20 +798,28 @@ const Polytope = (() => {
     consideredVertices.clear();
   }
 
-  function showImprovingEdges(vertices, fromIdx, improving, chosenIdx) {
+  function showDecisionEdges(vertices, fromIdx, adjacent, chosenIdx, objVals) {
     clearHints();
     const from = vertices[fromIdx];
-    for (const idx of improving) {
+    const currentValue = objVals?.[fromIdx] ?? 0;
+    let maxImprove = 0;
+    for (const idx of adjacent) {
+      maxImprove = Math.max(maxImprove, (objVals?.[idx] ?? currentValue) - currentValue);
+    }
+
+    for (const idx of adjacent) {
       const isChosen = idx === chosenIdx;
+      const delta = (objVals?.[idx] ?? currentValue) - currentValue;
+      const isImproving = delta > 1e-9;
       const len = from.distanceTo(vertices[idx]);
-      if (len < MIN_SIMPLEX_EDGE_LEN) continue;
-      consideredVertices.set(idx, isChosen ? 'chosen' : 'candidate');
+      const strength = maxImprove > 1e-9 ? Math.max(0, Math.min(1, delta / maxImprove)) : 0;
+      consideredVertices.set(idx, isChosen ? 'chosen' : (isImproving ? 'candidate' : 'blocked'));
       const seg = makeEdgeSegment(
         from, vertices[idx],
-        isChosen ? 0xffffff : 0xffc857,
-        isChosen ? 0.022 : 0.009,
-        isChosen ? 0.86 : 0.30,
-        isChosen ? 'chosen' : 'candidate'
+        isChosen ? 0xffffff : (isImproving ? 0xffc857 : 0x6f86a8),
+        isChosen ? 0.023 : (isImproving ? 0.008 + 0.010 * strength : 0.006),
+        isChosen ? 0.88 : (isImproving ? 0.22 + 0.34 * strength : 0.16),
+        isChosen ? 'chosen' : (isImproving ? 'candidate' : 'blocked')
       );
       if (seg) hintSegs.push(seg);
     }
@@ -943,7 +943,7 @@ const Polytope = (() => {
     setCursor, setVertexState, pulseVertex, pulseOptimal,
     startTrail, growTrail, finishTrail, updateTrails, clearTrails,
     beginTrailFade, setFocus,
-    showImprovingEdges, showBlockedEdges, pulseHints, clearHints,
+    showDecisionEdges, showBlockedEdges, pulseHints, clearHints,
     showOptimumHalo, clearOptimumHalo,
     nextColor
   };
@@ -1450,11 +1450,7 @@ const Animator = (() => {
         if (!hintsStarted) {
           const cur = path[step];
           const next = path[step+1];
-          const improving = en.adj[cur]
-            .filter(nb => en.objVals[nb] > en.objVals[cur] + 1e-9)
-            .filter(nb => en.vertices[cur].distanceTo(en.vertices[nb]) >= MIN_SIMPLEX_EDGE_LEN)
-            .sort((a,b) => en.objVals[a]-en.objVals[b]);
-          Polytope.showImprovingEdges(en.vertices, cur, improving, next);
+          Polytope.showDecisionEdges(en.vertices, cur, en.adj[cur], next, en.objVals);
           hintsStarted = true;
         }
         Polytope.setFocus(en.vertices, path[step], path[step+1], path.slice(0, step + 1), en.vertices[path[step]]);
